@@ -509,6 +509,11 @@ impl Inventory {
                 .chain(language_tasks.into_iter().flatten())
                 .chain(global_tasks);
 
+            // Use a separate map for tracking template task IDs to avoid deduplicating
+            // templates against history entries. This ensures templates are always visible
+            // even when they have the same resolved label as a history entry.
+            let mut template_labels_to_ids = HashMap::<String, HashSet<TaskId>>::default();
+
             let new_resolved_tasks = worktree_tasks
                 .flat_map(|(kind, task)| {
                     let id_base = kind.to_id_base();
@@ -555,7 +560,8 @@ impl Inventory {
                     .map(move |resolved_task| (kind.clone(), resolved_task, not_used_score))
                 })
                 .filter(|(_, resolved_task, _)| {
-                    match task_labels_to_ids.entry(resolved_task.resolved_label.clone()) {
+                    // Only deduplicate within templates, not against history entries
+                    match template_labels_to_ids.entry(resolved_task.resolved_label.clone()) {
                         hash_map::Entry::Occupied(mut o) => {
                             // Allow new tasks with the same label, if their context is different
                             o.get_mut().insert(resolved_task.id.clone())
@@ -1540,6 +1546,207 @@ mod tests {
                 .chain(worktree_independent_tasks.iter())
                 .cloned()
                 .collect::<Vec<_>>(),
+        );
+    }
+
+    /// Test for issue #40118: Task templates should remain visible even after scheduling
+    ///
+    /// Bug scenario:
+    /// 1. User has task "echo hello"
+    /// 2. User runs it → creates history entry "echo hello"
+    /// 3. User opens task modal again
+    /// 4. BUG: Only history entry visible, template disappeared
+    /// 5. User cannot spawn fresh execution that re-evaluates context
+    ///
+    /// Without the fix (line 515: separate template_labels_to_ids map):
+    /// - Template gets deduplicated against history entry (same label + ID)
+    /// - Template filtered out, only history remains
+    /// - Test would fail at line 1624: current.len() would be 0, not 1
+    ///
+    /// With the fix:
+    /// - Templates use their own deduplication map
+    /// - History and templates both visible in modal
+    /// - Test passes: both history and template present
+    #[gpui::test]
+    async fn test_template_visible_after_scheduling_with_same_context(cx: &mut TestAppContext) {
+        init_test(cx);
+        let inventory = cx.update(|cx| Inventory::new(cx));
+
+        // Create a task that uses no variables (will resolve to same label every time)
+        inventory.update(cx, |inventory, _| {
+            inventory
+                .update_file_based_tasks(
+                    TaskSettingsLocation::Global(tasks_file()),
+                    Some(&serde_json::to_string(&json!([
+                        {
+                            "label": "static task",
+                            "command": "echo",
+                            "args": ["hello"]
+                        }
+                    ])).unwrap()),
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        // Initially, only the template should be visible
+        let (used, current) = inventory
+            .update(cx, |inventory, cx| {
+                inventory.used_and_current_resolved_tasks(Arc::new(TaskContexts::default()), cx)
+            })
+            .await;
+
+        assert_eq!(
+            used.len(),
+            0,
+            "No history entries should exist before scheduling"
+        );
+        assert_eq!(
+            current.len(),
+            1,
+            "Template should be visible"
+        );
+        assert_eq!(
+            current[0].1.original_task().label,
+            "static task",
+            "Template should have correct label"
+        );
+
+        // Schedule the task (add it to history)
+        let scheduled_task = current[0].clone();
+        inventory.update(cx, |inventory, _| {
+            inventory.task_scheduled(scheduled_task.0, scheduled_task.1);
+        });
+
+        // Now check again with the same context
+        let (used, current) = inventory
+            .update(cx, |inventory, cx| {
+                inventory.used_and_current_resolved_tasks(Arc::new(TaskContexts::default()), cx)
+            })
+            .await;
+
+        assert_eq!(
+            used.len(),
+            1,
+            "History entry should exist after scheduling"
+        );
+        assert_eq!(
+            used[0].1.original_task().label,
+            "static task",
+            "History entry should have correct label"
+        );
+
+        // THIS IS THE KEY ASSERTION: The template should STILL be visible
+        // even though it has the same resolved label as the history entry
+        assert_eq!(
+            current.len(),
+            1,
+            "Template should STILL be visible after scheduling (this is the bug fix)"
+        );
+        assert_eq!(
+            current[0].1.original_task().label,
+            "static task",
+            "Template should still have correct label"
+        );
+
+        // Verify they are actually different instances (history vs template)
+        // History entries and templates should both be in the list
+        let all_tasks = used.into_iter().chain(current).collect::<Vec<_>>();
+        assert_eq!(
+            all_tasks.len(),
+            2,
+            "Both history entry and template should be visible"
+        );
+    }
+
+    /// Test for issue #40118: Task templates with variables should remain visible
+    ///
+    /// Real-world scenario:
+    /// 1. User has task "echo $ZED_FILE"
+    /// 2. Opens file.rs, runs task → history entry "echo /path/file.rs"
+    /// 3. User is still in file.rs, opens task modal
+    /// 4. BUG: Only history entry visible, template disappeared
+    /// 5. If user moves cursor or changes selection, cannot get fresh variable resolution
+    ///
+    /// This test verifies that templates remain accessible for fresh variable resolution
+    /// even when history entries with the same resolved context exist.
+    #[gpui::test]
+    async fn test_template_with_variables_visible_after_scheduling(cx: &mut TestAppContext) {
+        init_test(cx);
+        let inventory = cx.update(|cx| Inventory::new(cx));
+
+        // Create a task with variables (simulating the real-world use case)
+        inventory.update(cx, |inventory, _| {
+            inventory
+                .update_file_based_tasks(
+                    TaskSettingsLocation::Global(tasks_file()),
+                    Some(&serde_json::to_string(&json!([
+                        {
+                            "label": "echo file",
+                            "command": "echo",
+                            "args": ["$ZED_FILE"]
+                        }
+                    ])).unwrap()),
+                )
+                .unwrap();
+        });
+        cx.run_until_parked();
+
+        // Schedule the task with a specific context
+        let (_, current) = inventory
+            .update(cx, |inventory, cx| {
+                let mut task_contexts = TaskContexts::default();
+                // Simulate having a file open
+                task_contexts.active_worktree_context = Some((
+                    WorktreeId::from_usize(1),
+                    TaskContext::default(),
+                ));
+                inventory.used_and_current_resolved_tasks(Arc::new(task_contexts), cx)
+            })
+            .await;
+
+        // Schedule one of the resolved tasks
+        if !current.is_empty() {
+            let scheduled_task = current[0].clone();
+            inventory.update(cx, |inventory, _| {
+                inventory.task_scheduled(scheduled_task.0, scheduled_task.1);
+            });
+        }
+
+        // Query again with the same context
+        let (used, current) = inventory
+            .update(cx, |inventory, cx| {
+                let mut task_contexts = TaskContexts::default();
+                task_contexts.active_worktree_context = Some((
+                    WorktreeId::from_usize(1),
+                    TaskContext::default(),
+                ));
+                inventory.used_and_current_resolved_tasks(Arc::new(task_contexts), cx)
+            })
+            .await;
+
+        // The template should still be visible even after scheduling
+        assert!(
+            !used.is_empty(),
+            "History should contain the scheduled task"
+        );
+        assert!(
+            !current.is_empty(),
+            "Template should still be visible even after scheduling with same context"
+        );
+
+        // Both should have the same resolved label (same context)
+        // but both should be present in the list
+        let all_labels: Vec<_> = used
+            .iter()
+            .chain(current.iter())
+            .map(|(_, task)| task.original_task().label.clone())
+            .collect();
+
+        assert_eq!(
+            all_labels.iter().filter(|l| *l == "echo file").count(),
+            2,
+            "Both history and template with same base label should be visible"
         );
     }
 
